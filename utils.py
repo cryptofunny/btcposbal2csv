@@ -118,6 +118,29 @@ def decode_utxo(coin, outpoint, version=0.15):
 
     https://github.com/bitcoin/bitcoin/blob/6c4fecfaf7beefad0d1c3f8520bf50bb515a0716/src/coins.h#L58-L64
 
+    https://github.com/in3rsha/bitcoin-utxo-dump
+
+       type                          txid (little-endian)                      index (varint)
+           \                               |                                  /
+           <><--------------------------------------------------------------><>
+    key:   430000155b9869d56c66d9e86e3c01de38e3892a42b99949fe109ac034fff6583900
+
+    value: 71a9e87d62de25953e189f706bcf59263f15de1bf6c893bda9b045 <- obfuscated
+           b12dcefd8f872536b12dcefd8f872536b12dcefd8f872536b12dce <- extended obfuscateKey
+           c0842680ed5900a38f35518de4487c108e3810e6794fb68b189d8b <- deobfuscated (XOR)
+           <----><----><><-------------------------------------->
+            /      |    \                   |
+       varint   varint   varint          script <- P2PKH/P2SH hash160, P2PK public key, or complete script
+          |        |     nSize
+          |        |
+          |     amount (compressesed)
+          |
+          |
+   100000100001010100110
+   <------------------> \
+          height         coinbase
+
+
     :param coin: The coin to be decoded (extracted from the chainstate)
     :type coin: str
     :param outpoint: The outpoint to be decoded (extracted from the chainstate)
@@ -134,7 +157,7 @@ def decode_utxo(coin, outpoint, version=0.15):
     else:
         # First we will parse all the data encoded in the outpoint, that is, the transaction id and index of the utxo.
         # Check that the input data corresponds to a transaction.
-        assert outpoint[:2] == '43'
+        assert outpoint[:2] == b'43'  # 'C'
         # Check the provided outpoint has at least the minimum length (1 byte of key code, 32 bytes tx id, 1 byte index)
         assert len(outpoint) >= 68
         # Get the transaction id (LE) by parsing the next 32 bytes of the outpoint.
@@ -238,7 +261,7 @@ def decode_utxo_v08_v014(utxo):
         vout = []
     else:
         n = code >> 3
-        vout = [i for i in xrange(len(vout)) if vout[i] is not 0]
+        vout = [i for i in range(len(vout)) if vout[i] != 0]
 
     # If n is set, the encoded value contains a bitvector. The following bytes are parsed until n non-zero bytes have
     # been extracted. (If a 00 is found, the parsing continues but n is not decreased)
@@ -258,7 +281,7 @@ def decode_utxo_v08_v014(utxo):
         # Every position (i) with a 1 encodes the index of a non-spent output as i+2, since the two first outs (v[0] and
         # v[1] has been already counted)
         # (e.g: 0440 (LE) = 4004 (BE) = 0100 0000 0000 0100. It encodes outs 4 (i+2 = 2+2) and 16 (i+2 = 14+2).
-        extended_vout = [i+2 for i in xrange(len(bin_data))
+        extended_vout = [i+2 for i in range(len(bin_data))
                          if bin_data.find('1', i) == i]  # Finds the index of '1's and adds 2.
 
         # Finally, the first two vouts are included to the list (if they are non-spent).
@@ -308,13 +331,13 @@ def parse_ldb(fin_name, version=0.15, types=(0, 1)):
     elif version < 0.08:
         raise Exception("The utxo decoder only works for version 0.08 onwards.")
     else:
-        prefix = b'C'
+        prefix = b'C'  # 0x43
 
     # Open the LevelDB
     db = plyvel.DB(fin_name, compression=None)  # Change with path to chainstate
 
     # Load obfuscation key (if it exists)
-    o_key = db.get((unhexlify("0e00") + "obfuscate_key"))
+    o_key = db.get((unhexlify("0e00") + "obfuscate_key".encode('ascii')))
 
     # If the key exists, the leading byte indicates the length of the key (8 byte by default). If there is no key,
     # 8-byte zeros are used (since the key will be XORed with the given values).
@@ -341,6 +364,7 @@ def parse_ldb(fin_name, version=0.15, types=(0, 1)):
             value = decode_utxo(value, key, version)
 
         for out in value['outs']:
+            # out['out_type']:
             # 0 --> P2PKH
             # 1 --> P2SH
             # 2 - 3 --> P2PK(Compressed keys)
@@ -354,12 +378,12 @@ def parse_ldb(fin_name, version=0.15, types=(0, 1)):
             if out['out_type'] == 0:
                 if out['out_type'] not in types:
                     continue
-                add = hash_160_to_btc_address(out['data'], 0)
+                add = hash_160_to_btc_address(out['data'], b'\x00')  # b'\x00' for mainnet, b'\x6f' for testnet
                 yield add, out['amount'], value['height']
             elif out['out_type'] == 1:
                 if out['out_type'] not in types:
                     continue
-                add = hash_160_to_btc_address(out['data'], 5)
+                add = hash_160_to_btc_address(out['data'], b'\x05')  # b'\x05' for mainnet, b'\xc4' for testnet
                 yield add, out['amount'], value['height']
             elif out['out_type'] in (2, 3, 4, 5):
                 if out['out_type'] not in types:
@@ -367,6 +391,7 @@ def parse_ldb(fin_name, version=0.15, types=(0, 1)):
                 add = 'P2PK'
                 yield add, out['amount'], value['height']
             else:
+                print("unrecognized out['out_type'] = {}".format(out['out_type']))
                 not_decoded[0] += 1
                 not_decoded[1] += out['amount']
 
@@ -394,7 +419,7 @@ def deobfuscate_value(obfuscation_key, value):
     # Get the extended obfuscation key by concatenating the obfuscation key with itself until it is as large as the
     # value to be de-obfuscated.
     if l_obf < l_value:
-        extended_key = (obfuscation_key * ((l_value / l_obf) + 1))[:l_value]
+        extended_key = (obfuscation_key * int((l_value / l_obf) + 1))[:l_value]
     else:
         extended_key = obfuscation_key[:l_value]
 
@@ -436,9 +461,9 @@ def hash_160_to_btc_address(h160, v):
 
      Possible values:
 
-        - 0 for main network (PUBKEY_HASH).
-        - 111 For testnet (TESTNET_PUBKEY_HASH).
-    :type v: int
+        - b'\x00' for main network (PUBKEY_HASH).
+        - b'\x6f' For testnet (TESTNET_PUBKEY_HASH).
+    :type v: bytes
     :return: The corresponding Bitcoin address.
     :rtype: hex str
     """
@@ -448,7 +473,7 @@ def hash_160_to_btc_address(h160, v):
         h160 = unhexlify(h160)
 
     # Add the network version leading the previously calculated RIPEMD-160 hash.
-    vh160 = chr(v) + h160
+    vh160 = v + h160
     # Double sha256.
     h = sha256(sha256(vh160).digest()).digest()
     # Add the two first bytes of the result as a checksum tailing the RIPEMD-160 hash.
